@@ -12,11 +12,9 @@
 #   几分钟）。不过就不推送 main、也不启动 4～5 小时的 Gecko 构建。
 # - 手动 dispatch 勾 check_only = 只跑合并预演 + 编译检查，不推送、不构建、不发版。
 
-name: Sync upstream & build release
+name: Build iOS 12 Impactor IPA
 
 on:
-  schedule:
-    - cron: '0 2 * * 1'
   workflow_dispatch:
     inputs:
       check_only:
