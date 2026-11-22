@@ -109,3 +109,10 @@
   `UIMenuController.showMenu(from:rect:)`、`UIActivityIndicatorView .medium`、
   ObjC 侧 `fontDescriptorWithDesign:` 都是 13+。auto-merge 不报冲突，合并后必须对
   上游新增行 grep 一遍（清单见 `docs/upstream-merge.md` 0.15.0 节）。
+
+## 2026-11-22: iOS 12 native external URL handoff (unverified on device)
+
+- Observed: Google SMS verification emits `sms:/%2B...%3Fbody%3D...`; Gecko displays unknown-protocol error. Existing `UniversalLinkManager.decideHandoff` only considers http(s) universal links, so no UIKit handoff occurs.
+- Added a narrow native-scheme branch for `sms:`, `smsto:`, `tel:`, `mailto:`, `facetime:`, `facetime-audio:`. User gesture, non-private session, URI parsing, recipient length/character and body-length checks gate SMS. Uses MessageUI to show a compose sheet; the user must tap Send. `intent://` and arbitrary custom schemes remain unsupported. No query string or one-time SMS code is logged.
+- `sms:` processing decodes the outer URI once and the `body=` parameter once more, matching the observed Google double-encoded form. Duplicate preNavigation/onLoadRequest callbacks share completions and suppress immediate repeat handoff.
+- Do not publish or install until an Xcode iOS 12 compilation check and on-device tests verify `sms:`, `sms:/%2B...%3Fbody%3D...`, `tel:`, `mailto:` and canceled SMS. No Gecko changes intended.

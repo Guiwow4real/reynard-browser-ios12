@@ -7,9 +7,10 @@
 
 import Foundation
 import GeckoView
+import MessageUI
 import UIKit
 
-final class UniversalLinkManager {
+final class UniversalLinkManager: NSObject, MFMessageComposeViewControllerDelegate {
     private struct HandoffKey: Hashable {
         let session: ObjectIdentifier
         let uri: String
@@ -18,12 +19,16 @@ final class UniversalLinkManager {
     // In-flight handoffs per (session, uri); waiting callers join the first one.
     private var handoffCompletions: [HandoffKey: [(AllowOrDeny) -> Void]] = [:]
     private var failedHandoffs = Set<HandoffKey>()
+    private var recentExternalHandoffs = Set<HandoffKey>()
 
     func decideHandoff(
         for request: LoadRequest,
         in session: GeckoSession,
         completion: @escaping (AllowOrDeny) -> Void
     ) {
+        if handleExternalScheme(for: request, in: session, completion: completion) {
+            return
+        }
         guard
             Prefs.BrowsingSettings.openLinksInExternalApps,
             !session.isPrivateMode,
@@ -69,9 +74,113 @@ final class UniversalLinkManager {
         }
     }
 
+    // Gecko cannot load native iOS schemes itself. Only hand off schemes we
+    // explicitly recognize, and only for a navigation initiated by the user.
+    // Do not pass Android intent:// or arbitrary schemes to UIApplication.
+    private func handleExternalScheme(
+        for request: LoadRequest,
+        in session: GeckoSession,
+        completion: @escaping (AllowOrDeny) -> Void
+    ) -> Bool {
+        guard let colon = request.uri.firstIndex(of: ":") else { return false }
+        let scheme = request.uri[..<colon].lowercased()
+        guard ["sms", "smsto", "tel", "mailto", "facetime", "facetime-audio"].contains(scheme) else {
+            return false
+        }
+        guard !session.isPrivateMode,
+              request.hasUserGesture || request.isUserInitiatedNavigation else {
+            return false
+        }
+
+        let key = HandoffKey(session: ObjectIdentifier(session), uri: request.uri)
+        if recentExternalHandoffs.contains(key) {
+            completion(.deny)
+            return true
+        }
+        if handoffCompletions[key] != nil {
+            handoffCompletions[key]?.append(completion)
+            return true
+        }
+        handoffCompletions[key] = [completion]
+        let finish: (Bool) -> Void = { [weak self] didOpen in
+            guard let self else { return }
+            if didOpen {
+                self.recentExternalHandoffs.insert(key)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.recentExternalHandoffs.remove(key)
+                }
+            }
+            let callbacks = self.handoffCompletions.removeValue(forKey: key) ?? []
+            callbacks.forEach { $0(didOpen ? .deny : .allow) }
+        }
+
+        if scheme == "sms" || scheme == "smsto" {
+            presentMessageComposer(for: request.uri, completion: finish)
+        } else if let url = URL(string: request.uri) {
+            UIApplication.shared.open(url, options: [:], completionHandler: finish)
+        } else {
+            finish(false)
+        }
+        return true
+    }
+
+    // Google sometimes passes sms:/%2B...%3Fbody%3D%25E5..., where the
+    // outer URI and the body have each been percent-encoded once. Decode each
+    // layer separately; never send a message without showing iOS's composer.
+    private func presentMessageComposer(
+        for rawURI: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard MFMessageComposeViewController.canSendText(),
+              let decoded = rawURI.removingPercentEncoding else {
+            completion(false)
+            return
+        }
+        let schemeEnd = decoded.firstIndex(of: ":") ?? decoded.startIndex
+        let afterScheme = decoded.index(after: schemeEnd)
+        let addressAndQuery = decoded[afterScheme...].drop(while: { $0 == "/" })
+        let parts = addressAndQuery.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        let recipient = String(parts[0])
+        let allowed = CharacterSet(charactersIn: "+0123456789,; ")
+        guard !recipient.isEmpty, recipient.count <= 64,
+              recipient.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            completion(false)
+            return
+        }
+        let body: String?
+        if parts.count > 1, parts[1].lowercased().hasPrefix("body=") {
+            body = String(parts[1].dropFirst(5)).removingPercentEncoding
+        } else {
+            body = nil
+        }
+        guard body == nil || (body!.count <= 2048 && !body!.contains("\u{0000}")) else {
+            completion(false)
+            return
+        }
+        guard let root = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            completion(false)
+            return
+        }
+        var presenter = root
+        while let presented = presenter.presentedViewController { presenter = presented }
+        let composer = MFMessageComposeViewController()
+        composer.messageComposeDelegate = self
+        composer.recipients = [recipient]
+        composer.body = body
+        presenter.present(composer, animated: true) { completion(true) }
+    }
+
+    func messageComposeViewController(
+        _ controller: MFMessageComposeViewController,
+        didFinishWith result: MessageComposeResult
+    ) {
+        controller.dismiss(animated: true)
+    }
+
     func didCommitNavigation(in session: GeckoSession) {
         let sessionID = ObjectIdentifier(session)
         failedHandoffs = Set(failedHandoffs.filter { $0.session != sessionID })
+        recentExternalHandoffs = Set(recentExternalHandoffs.filter { $0.session != sessionID })
     }
 
     func didCreateNewSession(from session: GeckoSession, for uri: String) {
