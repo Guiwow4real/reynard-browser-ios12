@@ -49,14 +49,13 @@ fi
 	echo "ac_add_options --enable-application=mobile/ios"
 	echo "ac_add_options --target=$TARGET"
 	echo "ac_add_options --enable-ios-target=12.0"
-	# Do not use Mozilla's bootstrapped clang/lld here: its resource directory
-	# ships no iOS compiler-rt, so linking XUL fails with
-	# "undefined symbol: __isPlatformVersionAtLeast". The CI engine job selects
-	# Xcode 26.6, whose clang/ld supply libclang_rt.ios.a automatically.
-	# Set GECKO_BOOTSTRAP=1 only for a local build on an older Xcode.
-	if [ "${GECKO_BOOTSTRAP:-0}" = "1" ]; then
-		echo "ac_add_options --enable-bootstrap"
-	fi
+	# Mozilla's bootstrapped clang/lld is required: configure rejects Apple's
+	# ld ("Failed to find an adequate linker"). That toolchain ships no iOS
+	# compiler-rt, so the XUL link fails on __isPlatformVersionAtLeast; borrow
+	# Apple's libclang_rt.ios.a from the selected Xcode for target links only.
+	echo "ac_add_options --enable-bootstrap"
+	RESOURCE_DIR="$(xcrun --sdk iphoneos clang -print-resource-dir)"
+	echo "export LDFLAGS=\"-L$RESOURCE_DIR/lib/darwin -lclang_rt.ios\""
 	echo "ac_add_options --enable-webrtc"
 	echo "ac_add_options --enable-optimize"
 	echo "ac_add_options --disable-debug"
