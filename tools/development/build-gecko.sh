@@ -49,9 +49,14 @@ fi
 	echo "ac_add_options --enable-application=mobile/ios"
 	echo "ac_add_options --target=$TARGET"
 	echo "ac_add_options --enable-ios-target=12.0"
-	# Release builds do not bootstrap by default. Gecko needs a newer LLVM
-	# toolchain than the Apple compiler shipped with Xcode 15.4.
-	echo "ac_add_options --enable-bootstrap"
+	# Do not use Mozilla's bootstrapped clang/lld here: its resource directory
+	# ships no iOS compiler-rt, so linking XUL fails with
+	# "undefined symbol: __isPlatformVersionAtLeast". The CI engine job selects
+	# Xcode 26.6, whose clang/ld supply libclang_rt.ios.a automatically.
+	# Set GECKO_BOOTSTRAP=1 only for a local build on an older Xcode.
+	if [ "${GECKO_BOOTSTRAP:-0}" = "1" ]; then
+		echo "ac_add_options --enable-bootstrap"
+	fi
 	echo "ac_add_options --enable-webrtc"
 	echo "ac_add_options --enable-optimize"
 	echo "ac_add_options --disable-debug"
