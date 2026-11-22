@@ -1,0 +1,232 @@
+# Sync upstream & build release (jemalloc, default)
+#
+# - 每周一定时（+ 可手动触发）：合并 minh-ton/reynard-browser 的 main，
+#   上游 workflows 照例丢弃（只保留本仓自有 workflows），合完推回本仓库 main。
+# - 有新提交（或手动触发）时在 macOS runner 上全量构建标准 jailbroken IPA（jemalloc）。
+# - 按 CURRENT_VERSION 打 tag `<version>-ios12`：同名 release 删掉重建。
+# - 本仓唯一允许删/建 release 的入口（nojemalloc workflow 只负责往同 tag 追加资产）。
+# - 在非 main 分支上手动 dispatch = 仅编译验证：不合并上游、不推送、不碰 release，
+#   只产出 artifact（用于合并分支在进 main 前先过一遍 CI 构建）。
+# - 合并后、推送前先跑 iOS 12 编译检查（tools/development/check-ios12.sh：用 Xcode 26.6
+#   自带的 swiftc/clang + iPhoneOS SDK 全量编 App 侧 4 个 target，与正式构建同编译器同 SDK，
+#   几分钟）。不过就不推送 main、也不启动 4～5 小时的 Gecko 构建。
+# - 手动 dispatch 勾 check_only = 只跑合并预演 + 编译检查，不推送、不构建、不发版。
+
+name: Reynard external URL build
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: "Only run upstream-merge dry run + iOS 12 compile check (no push, no build, no release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Merge upstream/main + iOS 12 compile check
+    # macOS: the check uses the same Xcode compiler + SDK as the real build
+    runs-on: macos-26
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      version: ${{ steps.merge.outputs.version }}
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Xcode 26.6
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+
+      - name: Merge upstream if there are new commits (local, pushed after the check)
+        id: merge
+        run: |
+          set -eu
+          BASE=""
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "non-main ref (${{ github.ref_name }}): build-only verification, skip upstream merge"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "base=" >> "$GITHUB_OUTPUT"
+            VERSION="$(sed -n 's/^CURRENT_VERSION = //p' browser/Configuration/Reynard.xcconfig | tr -d ' ')"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/minh-ton/reynard-browser.git
+          git fetch upstream main
+          NEW_COUNT="$(git rev-list --count HEAD..upstream/main)"
+          echo "upstream new commits: $NEW_COUNT"
+          if [ "$NEW_COUNT" = "0" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            SHORT="$(git rev-parse --short upstream/main)"
+            BASE="$(git rev-parse HEAD)"
+            git merge --no-ff --no-edit -m "chore: merge upstream/main $SHORT" upstream/main
+            KEEP_DIR="$(mktemp -d)"
+            for f in .github/workflows/sync-upstream.yml .github/workflows/build-nojemalloc.yml; do
+              if [ -f "$f" ]; then
+                mkdir -p "$KEEP_DIR/$(dirname "$f")"
+                cp "$f" "$KEEP_DIR/$f"
+              fi
+            done
+            rm -rf .github/workflows
+            if [ -d "$KEEP_DIR/.github/workflows" ]; then
+              mkdir -p .github/workflows
+              # "/." copies the contents on both BSD and GNU cp (GNU would nest a "workflows/" dir)
+              cp -R "$KEEP_DIR/.github/workflows/." .github/workflows/
+            fi
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: drop upstream workflows (local ldid builds only)"
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          VERSION="$(sed -n 's/^CURRENT_VERSION = //p' browser/Configuration/Reynard.xcconfig | tr -d ' ')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Swift/ObjC availability errors used to surface only after the 4-5h Gecko
+      # build (0.15.0: one .insetGrouped). Catch them here in minutes, before
+      # anything is pushed. With a fresh upstream merge, also list post-iOS-12
+      # SDK APIs in the new engine patch lines (informational, review by hand).
+      - name: iOS 12 compile check (Xcode swiftc + iPhoneOS SDK, no Gecko build)
+        run: ./tools/development/check-ios12.sh ${{ steps.merge.outputs.base }}
+
+      - name: Push merge to main
+        if: ${{ steps.merge.outputs.changed == 'true' && github.event.inputs.check_only != 'true' }}
+        run: git push origin HEAD:main
+
+  build:
+    name: Build jailbroken IPA (jemalloc)
+    needs: sync
+    if: ${{ github.event.inputs.check_only != 'true' && (needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch') }}
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          submodules: false
+
+      - name: Set up Xcode 26.6
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+
+      - name: Install build dependencies
+        run: |
+          brew install python@3.12 lld cbindgen llvm
+          echo "$(brew --prefix python@3.12)/libexec/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive support/idevice
+          git submodule update --init --depth 1 engine/firefox
+
+      - name: Update Gecko source
+        run: ./tools/development/update-gecko.sh
+
+      - name: Apply Gecko patches
+        run: ./tools/development/apply-patches.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Hash Rust toolchain for cache
+        id: rust_toolchain
+        run: echo "hash=$(rustc -Vv | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Gecko dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.mozbuild
+          key: ios12-gecko-deps-${{ steps.rust_toolchain.outputs.hash }}-${{ hashFiles('engine/release.txt') }}
+          restore-keys: |
+            ios12-gecko-deps-${{ steps.rust_toolchain.outputs.hash }}-
+
+      - name: Restore idevice build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            support/idevice/target
+            browser/Reynard/JIT/RPPairing/libidevice_ffi.a
+          key: ios12-idevice-${{ steps.rust_toolchain.outputs.hash }}-${{ hashFiles('support/idevice/Cargo.lock', 'support/idevice/Cargo.toml', 'tools/development/build-idevice.sh') }}
+          restore-keys: |
+            ios12-idevice-${{ steps.rust_toolchain.outputs.hash }}-
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Build Gecko
+        env:
+          CC: clang
+          CXX: clang++
+          LD: ld64.lld
+        run: ./tools/development/build-gecko.sh --use-sccache --auto-clobber
+
+      - name: Build idevice support library
+        run: ./tools/development/build-idevice.sh
+
+      - name: Install packaging dependencies
+        run: brew install ldid
+
+      - name: Build app
+        run: ./tools/release/build-app.sh --no-signing
+
+      - name: Create jailbroken IPA
+        run: ./tools/release/create-ipa.sh --jailbroken
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Reynard-Jailbroken.ipa
+          path: dist/Reynard-Jailbroken.ipa
+          if-no-files-found: error
+
+  release:
+    name: Create or replace version release
+    needs: [sync, build]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Reynard-Jailbroken.ipa
+          path: dist
+
+      - name: Replace same-version release or create new one
+        run: |
+          set -eu
+          REPO="$GITHUB_REPOSITORY"
+          TAG="${{ needs.sync.outputs.version }}-ios12"
+          echo "release tag: $TAG"
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            echo "release $TAG exists, deleting before re-creating"
+            gh release delete "$TAG" -y --cleanup-tag -R "$REPO"
+          fi
+          gh release create "$TAG" dist/Reynard-Jailbroken.ipa -R "$REPO" \
+            --title "Reynard iOS 12 $TAG" \
+            --notes "Automated build from main (upstream sync). Jailbroken IPA for iOS 12 (moe.bemly.reynard, minos 12.0), install with AppSync Unified. A12 unc0ver substitute conflict on 12.2: see no-jemalloc variant."
