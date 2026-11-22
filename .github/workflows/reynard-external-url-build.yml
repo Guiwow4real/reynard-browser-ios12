@@ -1,0 +1,13 @@
+name: Reynard external URL build
+on:
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: "Run compile check only"
+        type: boolean
+        default: true
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Use the feature branch to execute its build workflow'
